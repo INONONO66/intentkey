@@ -151,6 +151,7 @@ fn render(response: DaemonResponse, format: OutputFormat) -> Result<()> {
                 writeln!(output, "{}", grant.handoff_url)?;
             }
             DaemonResponse::Rejected { .. } => unreachable!("handled before rendering"),
+            _ => writeln!(output, "unsupported response in compatibility CLI")?,
         },
     }
     Ok(())

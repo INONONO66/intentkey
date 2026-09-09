@@ -7,15 +7,30 @@ license.workspace = true
 repository.workspace = true
 description = "Privileged local daemon for IntentKey"
 
+[features]
+default = []
+test-harness = []
+
 [dependencies]
 clap.workspace = true
 color-eyre.workspace = true
 intentkey-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "daemon_process"
+required-features = ["test-harness"]
 
 [lints]
 workspace = true

@@ -131,10 +131,11 @@ impl DaemonState {
             .catalog
             .lock()
             .map_err(|_| StateError::StateUnavailable)?;
-        if let Some(old) = catalog.get(checked.item_id.as_str()) {
-            if old.revision == checked.revision && old != &checked {
-                return Err(StateError::Unsupported);
-            }
+        if let Some(old) = catalog.get(checked.item_id.as_str())
+            && old.revision == checked.revision
+            && old != &checked
+        {
+            return Err(StateError::Unsupported);
         }
         catalog.insert(checked.item_id.as_str().to_owned(), checked);
         drop(catalog);
@@ -395,13 +396,11 @@ impl DaemonState {
             .lock()
             .map_err(|_| StateError::StateUnavailable)?
             .get(request.item_id.as_str())
-        {
-            if item.revision != request.revision
+            && (item.revision != request.revision
                 || item.login_components != request.login_components
-                || item.kind != operation_kind(request.operation)
-            {
-                return Err(StateError::Unsupported);
-            }
+                || item.kind != operation_kind(request.operation))
+        {
+            return Err(StateError::Unsupported);
         }
         let request_id = format!("req_{}", Uuid::new_v4().simple());
         let reference = format!("op_{}", Uuid::new_v4().simple());

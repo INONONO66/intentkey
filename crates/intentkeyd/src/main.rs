@@ -1,10 +1,10 @@
 //! `intentkeyd` privileged local daemon entry point.
 
 use std::{
-    fs::File,
+    fs::{File, Metadata},
     io,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -30,6 +30,8 @@ const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 )]
 struct Cli {
     /// Unix socket that local clients connect to.
+    /// Its storage directory is created as 0700; an existing directory must be
+    /// owned by this user and already 0700. Existing directories are never chmodded.
     #[arg(long, env = "INTENTKEY_SOCKET", default_value_os_t = default_socket_path())]
     socket: PathBuf,
 
@@ -70,23 +72,28 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    prepare_socket_parent(&cli.socket).await?;
-    let listener = UnixListener::bind(&cli.socket)
-        .wrap_err_with(|| format!("could not bind {}", cli.socket.display()))?;
-    std::fs::set_permissions(&cli.socket, std::fs::Permissions::from_mode(0o600))
-        .wrap_err("could not restrict socket permissions")?;
-    let _socket_guard = SocketGuard(cli.socket.clone());
+    // A socket pair obtains the OS-authenticated current UID without trusting environment data.
+    let (identity, _peer) = tokio::net::UnixStream::pair()?;
+    let uid = identity.peer_cred()?.uid();
+    prepare_socket_parent(&cli.socket, uid)?;
     let database = cli
         .socket
         .parent()
         .map(|parent| parent.join("state.sqlite3"))
         .ok_or_else(|| eyre!("socket path has no parent"))?;
     let lock_path = database.with_extension("sqlite3.lock");
-    let _database_lock = DatabaseLock::acquire(&lock_path)?;
-    if database.exists() {
-        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
-            .wrap_err("could not restrict database permissions")?;
-    }
+    let _database_lock = DatabaseLock::acquire(&lock_path, uid)?;
+    let _database_file = open_private_file(&database, uid)?;
+    validate_database_sidecars(&database, uid)?;
+    prepare_socket(&cli.socket, uid)?;
+    let listener = UnixListener::bind(&cli.socket)
+        .wrap_err_with(|| format!("could not bind {}", cli.socket.display()))?;
+    let _socket_guard = SocketGuard {
+        path: cli.socket.clone(),
+        metadata: std::fs::symlink_metadata(&cli.socket)?,
+    };
+    std::fs::set_permissions(&cli.socket, std::fs::Permissions::from_mode(0o600))
+        .wrap_err("could not restrict socket permissions")?;
     let state = Arc::new(
         intentkeyd::DaemonState::open(&database)
             .map_err(|_| eyre!("could not open daemon state database"))?,
@@ -235,6 +242,7 @@ async fn serve_connection(
     Ok(())
 }
 
+#[cfg(feature = "test-harness")]
 fn unix_now() -> Result<u64> {
     Ok(u64::try_from(
         std::time::SystemTime::now()
@@ -243,23 +251,131 @@ fn unix_now() -> Result<u64> {
     )?)
 }
 
-async fn prepare_socket_parent(socket: &Path) -> Result<()> {
+fn prepare_socket_parent(socket: &Path, uid: u32) -> Result<()> {
     let parent = socket
         .parent()
-        .ok_or_else(|| eyre!("socket path has no parent"))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .wrap_err("could not create socket directory")?;
-    if socket.exists() {
-        match std::os::unix::net::UnixStream::connect(socket) {
-            Ok(_) => return Err(eyre!("a daemon is already serving {}", socket.display())),
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                std::fs::remove_file(socket).wrap_err("could not remove stale socket")?;
-            }
-            Err(error) => return Err(eyre!("could not verify existing socket: {error}")),
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| eyre!("socket path must name a private storage directory"))?;
+    let absolute = std::path::absolute(parent)?;
+    if absolute
+        .components()
+        .any(|part| part == Component::ParentDir)
+    {
+        return Err(eyre!("storage path must not contain parent traversal"));
+    }
+    // Protect pathname lookups: no foreign-owned or freely replaceable ancestors.
+    // Root-owned system symlinks (such as macOS /var) and sticky temp roots are safe.
+    for ancestor in absolute.ancestors() {
+        let metadata = match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).wrap_err("could not inspect storage ancestor"),
+        };
+        if metadata.file_type().is_symlink() && metadata.uid() == 0 && ancestor != absolute {
+            continue;
+        }
+        if !metadata.is_dir()
+            || (metadata.uid() != uid && metadata.uid() != 0)
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(eyre!("unsafe storage ancestor: {}", ancestor.display()));
+        }
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .wrap_err("could not create private socket directory")?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
+        return Err(eyre!(
+            "storage directory must be owned by the daemon user and already mode 0700: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_database_sidecars(database: &Path, uid: u32) -> Result<()> {
+    // SQLite can also open or remove recovery sidecars during initialization.
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = database.with_file_name(format!("state.sqlite3{suffix}"));
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => validate_private_file(&sidecar, &metadata, uid)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).wrap_err("could not inspect database sidecar"),
         }
     }
     Ok(())
+}
+
+fn validate_private_file(path: &Path, metadata: &Metadata, uid: u32) -> Result<()> {
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(eyre!(
+            "storage file must be an owned, single-link regular file with mode 0600: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn open_private_file(path: &Path, uid: u32) -> Result<File> {
+    // create_new rejects even dangling symlinks and applies 0600 at creation,
+    // before any SQLite write. The verified private parent excludes foreign swaps.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            validate_private_file(path, &metadata, uid)?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?;
+            if !same_file(&metadata, &file.metadata()?) {
+                return Err(eyre!(
+                    "storage file changed while opening: {}",
+                    path.display()
+                ));
+            }
+            Ok(file)
+        }
+        Err(error) => Err(error).wrap_err_with(|| format!("could not create {}", path.display())),
+    }
+}
+
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn prepare_socket(socket: &Path, uid: u32) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).wrap_err("could not inspect existing socket"),
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != uid {
+        return Err(eyre!("existing socket path is not an owned Unix socket"));
+    }
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => Err(eyre!("a daemon is already serving {}", socket.display())),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            if !same_file(&metadata, &std::fs::symlink_metadata(socket)?) {
+                return Err(eyre!("existing socket changed during startup"));
+            }
+            std::fs::remove_file(socket).wrap_err("could not remove stale socket")
+        }
+        Err(error) => Err(eyre!("could not verify existing socket: {error}")),
+    }
 }
 
 fn init_tracing(verbosity: u8) {
@@ -280,7 +396,10 @@ fn init_tracing(verbosity: u8) {
 }
 
 #[derive(Debug)]
-struct SocketGuard(PathBuf);
+struct SocketGuard {
+    path: PathBuf,
+    metadata: Metadata,
+}
 
 #[derive(Debug)]
 struct DatabaseLock {
@@ -288,25 +407,26 @@ struct DatabaseLock {
 }
 
 impl DatabaseLock {
-    #[allow(clippy::incompatible_msrv)]
-    fn acquire(path: &Path) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .wrap_err("could not open daemon state lock")?;
+    fn acquire(path: &Path, uid: u32) -> Result<Self> {
+        let file = open_private_file(path, uid).wrap_err("could not open daemon state lock")?;
         file.try_lock()
             .map_err(|error| eyre!("another daemon is using this state database: {error}"))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .wrap_err("could not restrict database lock permissions")?;
         Ok(Self { _file: file })
     }
 }
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.0)
+        let result = std::fs::symlink_metadata(&self.path).and_then(|metadata| {
+            if same_file(&self.metadata, &metadata) {
+                std::fs::remove_file(&self.path)
+            } else {
+                Err(io::Error::other(
+                    "socket path changed; leaving replacement untouched",
+                ))
+            }
+        });
+        if let Err(error) = result
             && error.kind() != io::ErrorKind::NotFound
         {
             warn!(error = %error, "socket.cleanup_failed");

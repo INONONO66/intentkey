@@ -28,5 +28,9 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[[test]]
+name = "daemon_process"
+required-features = ["test-harness"]
+
 [lints]
 workspace = true

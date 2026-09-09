@@ -629,20 +629,18 @@ impl DaemonState {
             .map_err(|_| StateError::StateUnavailable)?;
         let admitted: UseRequest =
             serde_json::from_str(&request_data).map_err(|_| StateError::StateUnavailable)?;
-        if admitted.revision != 0 {
-            let item = self
-                .catalog
-                .lock()
-                .map_err(|_| StateError::StateUnavailable)?
-                .get(admitted.item_id.as_str())
-                .cloned()
-                .ok_or(StateError::Unsupported)?;
-            if item.revision != admitted.revision
-                || item.login_components != admitted.login_components
-                || item.kind != operation_kind(admitted.operation)
-            {
-                return Err(StateError::Unsupported);
-            }
+        let item = self
+            .catalog
+            .lock()
+            .map_err(|_| StateError::StateUnavailable)?
+            .get(admitted.item_id.as_str())
+            .cloned()
+            .ok_or(StateError::Unsupported)?;
+        if item.revision != admitted.revision
+            || item.login_components != admitted.login_components
+            || item.kind != operation_kind(admitted.operation)
+        {
+            return Err(StateError::Unsupported);
         }
         let claimed = tx
             .execute(
@@ -1352,16 +1350,17 @@ mod tests {
     }
 
     fn use_request() -> UseRequest {
+        let item = catalog_item();
         UseRequest {
-            item_id: ItemId::new("itm_test"),
+            item_id: item.item_id,
             intent: Intent {
                 action: "sign_in".to_owned(),
                 target: TargetOrigin::parse("https://github.com").expect("valid origin"),
             },
             operation: UseOperation::Login(LoginUse::Password),
-            revision: 0,
-            login_components: Vec::new(),
-            selected_component: None,
+            revision: item.revision,
+            login_components: item.login_components,
+            selected_component: Some(ComponentId::new("cmp_password").expect("component")),
         }
     }
 
@@ -1441,6 +1440,7 @@ mod tests {
     #[test]
     fn request_id_is_idempotent_and_cannot_change_payload() {
         let daemon = DaemonState::new().expect("in-memory database initializes");
+        daemon.register_item(catalog_item()).expect("catalog");
         let first = daemon
             .queue_use("req_1", &use_request(), 2_000, 1_000)
             .expect("request queued");
@@ -1460,6 +1460,7 @@ mod tests {
     #[test]
     fn dispatched_work_is_not_requeued_and_recovers_as_indeterminate() {
         let daemon = DaemonState::new().expect("in-memory database initializes");
+        daemon.register_item(catalog_item()).expect("catalog");
         let queued = daemon
             .queue_use("req_1", &use_request(), 2_000, 1_000)
             .expect("request queued");
@@ -1489,6 +1490,7 @@ mod tests {
         let handoff_base = Url::parse("http://127.0.0.1:43117/setup").expect("valid base");
 
         let daemon = DaemonState::open(&database).expect("database opens");
+        daemon.register_item(catalog_item()).expect("catalog");
         let prepared = daemon
             .issue_setup(setup_request(), 1_000, &handoff_base)
             .expect("prepared ticket persisted");
@@ -1548,6 +1550,7 @@ mod tests {
     #[test]
     fn receipts_serialize_as_metadata_only() {
         let daemon = DaemonState::new().expect("in-memory database initializes");
+        daemon.register_item(catalog_item()).expect("catalog");
         let receipt = daemon
             .queue_use("req_1", &use_request(), 2_000, 1_000)
             .expect("request queued");
@@ -1607,6 +1610,10 @@ mod tests {
         let database = directory.path().join("daemon.sqlite3");
         let first = DaemonState::open(&database).expect("first handle opens");
         let second = DaemonState::open(&database).expect("second handle opens");
+        first.register_item(catalog_item()).expect("first catalog");
+        second
+            .register_item(catalog_item())
+            .expect("second catalog");
         let queued = first
             .queue_use("req_concurrent", &use_request(), 2_000, 1_000)
             .expect("request queued");
@@ -1637,6 +1644,7 @@ mod tests {
     #[test]
     fn terminal_results_are_immutable_even_after_authorization_expiry() {
         let daemon = DaemonState::new().expect("in-memory database initializes");
+        daemon.register_item(catalog_item()).expect("catalog");
         let queued = daemon
             .queue_use("req_terminal", &use_request(), 1_020, 1_000)
             .expect("request queued");
@@ -1661,6 +1669,7 @@ mod tests {
     #[test]
     fn dispatch_claim_and_receipt_update_roll_back_together() {
         let daemon = DaemonState::new().expect("in-memory database initializes");
+        daemon.register_item(catalog_item()).expect("catalog");
         let queued = daemon
             .queue_use("req_rollback", &use_request(), 2_000, 1_000)
             .expect("request queued");
@@ -1930,6 +1939,69 @@ mod tests {
     }
 
     #[test]
+    fn revision_zero_dispatch_rechecks_catalog_snapshot() {
+        for change_catalog in [false, true] {
+            let daemon = DaemonState::new().expect("database initializes");
+            let session = daemon.open_session(0).expect("session");
+            let mut item = catalog_item();
+            item.revision = 0;
+            daemon
+                .register_item(item.clone())
+                .expect("revision zero catalog");
+            let (link, _) = daemon
+                .prepare_use(
+                    PrepareUseRequest {
+                        session: session.clone(),
+                        item_id: item.item_id.clone(),
+                        revision: 0,
+                        intent: use_request().intent,
+                        operation: UseOperation::Login(LoginUse::Password),
+                        selected_component: Some(ComponentId::new("cmp_password").expect("id")),
+                        ttl_ms: 1_000,
+                    },
+                    1_000,
+                )
+                .expect("revision zero prepares");
+            let queued = daemon
+                .execute_use(ExecuteUseRequest { session, link }, 1_001)
+                .expect("revision zero executes");
+            assert_eq!(queued.revision, 0);
+            assert_eq!(queued.outcome, OperationOutcome::Queued);
+            if change_catalog {
+                item.revision = 1;
+                item.login_components[0].provider_presence = ComponentPresence::Absent;
+                daemon
+                    .register_item(item)
+                    .expect("new revision without password");
+                assert_eq!(
+                    daemon.mark_dispatched(&queued.operation_ref, 1_002),
+                    Err(StateError::Unsupported)
+                );
+                assert_eq!(daemon.receipt(&queued.operation_ref), Ok(queued.clone()));
+                let outbox: (String, Option<i64>) = daemon
+                    .db
+                    .lock()
+                    .expect("database lock")
+                    .query_row(
+                        "SELECT state,claimed_at_ms FROM dispatch_outbox WHERE operation_ref=?1",
+                        params![queued.operation_ref],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("outbox retained");
+                assert_eq!(outbox, ("pending".to_owned(), None));
+            } else {
+                assert_eq!(
+                    daemon
+                        .mark_dispatched(&queued.operation_ref, 1_002)
+                        .expect("unchanged revision zero dispatches")
+                        .outcome,
+                    OperationOutcome::Dispatched
+                );
+            }
+        }
+    }
+
+    #[test]
     fn raw_session_and_use_ticket_are_not_persisted_in_logical_tables() {
         let daemon = DaemonState::new().expect("database initializes");
         daemon.register_item(catalog_item()).expect("catalog");
@@ -1980,12 +2052,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database = directory.path().join("daemon.sqlite3");
         let daemon = DaemonState::open(&database).expect("database opens");
+        daemon.register_item(catalog_item()).expect("catalog");
         let queued = daemon
             .queue_use("req_outbox", &use_request(), 2_000, 1_000)
             .expect("request queued");
         drop(daemon);
 
         let reopened = DaemonState::open(&database).expect("database reopens");
+        reopened
+            .register_item(catalog_item())
+            .expect("reloaded catalog");
         let pending: String = reopened
             .db
             .lock()

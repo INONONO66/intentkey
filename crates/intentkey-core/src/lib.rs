@@ -305,7 +305,12 @@ pub enum LoginUse {
 
 /// Typed operation requested against an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "variant", rename_all = "snake_case")]
+#[serde(
+    tag = "operation",
+    content = "variant",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum UseOperation {
     /// Use a login item.
     Login(LoginUse),
@@ -1044,6 +1049,40 @@ mod tests {
             .expect("frame read");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn daemon_request_rejects_nested_operation_target() {
+        let raw = r#"{
+            "op":"prepare_use",
+            "input":{
+                "session":"ses_test",
+                "item_id":"itm_test",
+                "revision":0,
+                "intent":{"action":"sign_in","target":"https://github.com/"},
+                "operation":{
+                    "operation":"login",
+                    "variant":"password",
+                    "target":"https://other.example/"
+                },
+                "selected_component":"cmp_password",
+                "ttl_ms":1000
+            }
+        }"#;
+        let mut valid: serde_json::Value = serde_json::from_str(raw).expect("valid JSON");
+        valid["input"]["operation"]
+            .as_object_mut()
+            .expect("operation object")
+            .remove("target");
+        assert!(matches!(
+            serde_json::from_value::<DaemonRequest>(valid),
+            Ok(DaemonRequest::PrepareUse(PrepareUseRequest {
+                operation: UseOperation::Login(LoginUse::Password),
+                revision: 0,
+                ..
+            }))
+        ));
+        assert!(serde_json::from_str::<DaemonRequest>(raw).is_err());
     }
 
     #[test]

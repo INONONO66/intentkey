@@ -51,6 +51,9 @@ impl Daemon {
             .arg(catalog)
             .arg("--test-recovery-log")
             .arg(recovery_log)
+            .env("HOME", fs::canonicalize(dir)?)
+            .env("XDG_DATA_HOME", fs::canonicalize(dir)?.join("data"))
+            .env("XDG_RUNTIME_DIR", dir)
             .env("RUST_LOG", "intentkeyd=info")
             .stderr(Stdio::piped())
             .stdout(Stdio::null());

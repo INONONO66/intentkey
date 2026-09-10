@@ -1,5 +1,7 @@
 //! `intentkey` owner and agent command-line client.
 
+pub mod owner;
+
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -9,8 +11,10 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Context, Result, eyre};
 use intentkey_core::{
-    CredentialKind, DaemonRequest, DaemonResponse, Intent, SetupRequest, TargetOrigin,
-    default_socket_path, read_wire_value, write_wire_value,
+    CredentialKind, DaemonRequest, DaemonResponse, Intent, ItemId, SetupRequest, TargetOrigin,
+    default_socket_path,
+    owner::{NativeKind, OwnerRequest, OwnerResponse},
+    read_wire_value, write_wire_value,
 };
 use tokio::{net::UnixStream, time::timeout};
 
@@ -40,6 +44,14 @@ struct Cli {
 enum Command {
     /// Check whether the local broker is ready.
     Status,
+    /// Manage encrypted native custody through the private owner channel.
+    Vault {
+        /// Inherited pipe or Unix socket containing raw length-prefixed private inputs.
+        #[arg(long, global = true)]
+        secret_fd: Option<i32>,
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
     /// Create a secret-free owner setup handoff.
     Setup {
         /// Exact HTTP(S) origin at which the credential may be used.
@@ -55,6 +67,71 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         ttl_seconds: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum VaultCommand {
+    /// Initialize a new encrypted vault; never overwrite an existing vault.
+    Init,
+    /// Unlock persisted custody after authentication.
+    Unlock,
+    /// Authenticate and drop decrypted custody.
+    Lock,
+    /// List opaque metadata from unlocked custody.
+    List,
+    /// Generate and store random bearer material without revealing it.
+    Generate,
+    /// Store the separately supplied private value.
+    Store {
+        #[arg(long, value_enum)]
+        kind: VaultKind,
+    },
+    /// Replace a private value at its exact current revision.
+    Update {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Remove an item at its exact current revision.
+    Remove {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum VaultKind {
+    Password,
+    Bearer,
+}
+
+impl From<VaultCommand> for OwnerRequest {
+    fn from(command: VaultCommand) -> Self {
+        match command {
+            VaultCommand::Init => Self::Init,
+            VaultCommand::Unlock => Self::Unlock,
+            VaultCommand::Lock => Self::Lock,
+            VaultCommand::List => Self::List,
+            VaultCommand::Generate => Self::Generate,
+            VaultCommand::Store { kind } => Self::Store {
+                kind: match kind {
+                    VaultKind::Password => NativeKind::Password,
+                    VaultKind::Bearer => NativeKind::Bearer,
+                },
+            },
+            VaultCommand::Update { item_id, revision } => Self::Update {
+                item_id: ItemId::new(item_id),
+                revision,
+            },
+            VaultCommand::Remove { item_id, revision } => Self::Remove {
+                item_id: ItemId::new(item_id),
+                revision,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -83,17 +160,33 @@ enum OutputFormat {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
     color_eyre::install()?;
     let cli = Cli::parse();
+    if let Command::Vault { command, secret_fd } = cli.command {
+        let response = owner::run(&cli.socket, command.into(), secret_fd)
+            .await
+            .unwrap_or_else(OwnerResponse::Error);
+        let failed = matches!(response, OwnerResponse::Error(_));
+        let mut output = io::stdout().lock();
+        serde_json::to_writer(&mut output, &response)?;
+        writeln!(output)?;
+        return Ok(if failed {
+            std::process::ExitCode::FAILURE
+        } else {
+            std::process::ExitCode::SUCCESS
+        });
+    }
     let request = build_request(cli.command)?;
     let response = exchange(&cli.socket, &request).await?;
-    render(response, cli.format)
+    render(response, cli.format)?;
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 fn build_request(command: Command) -> Result<DaemonRequest> {
     match command {
         Command::Status => Ok(DaemonRequest::Health),
+        Command::Vault { .. } => Err(eyre!("owner commands require the dedicated owner channel")),
         Command::Setup {
             origin,
             action,

@@ -1,6 +1,6 @@
 //! Authenticated, bounded native-vault envelope.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
@@ -24,8 +24,15 @@ fn wrapping_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, E
     }
     let params = Params::new(65_536, 3, 1, Some(32)).map_err(|_| Error::Unavailable)?;
     let mut key = Zeroizing::new([0_u8; 32]);
+    // Argon2 0.6's allocating helper releases its Blocks without zeroizing.
+    // Keep ownership here so RAII wipes the workspace on every return path.
+    let mut workspace = Zeroizing::new(Vec::<Block>::new());
+    workspace
+        .try_reserve_exact(params.block_count())
+        .map_err(|_| Error::Unavailable)?;
+    workspace.resize(params.block_count(), Block::default());
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase, salt, key.as_mut())
+        .hash_password_into_with_memory(passphrase, salt, key.as_mut(), &mut *workspace)
         .map_err(|_| Error::Unavailable)?;
     Ok(key)
 }
@@ -151,6 +158,27 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_wrapping_key_preserves_v1_synthetic_vector() -> Result<(), Error> {
+        // Public noncredential fixture, captured from the original Argon2 0.6
+        // allocating seam with the exact V1 profile; never a real vault key.
+        let expected = [
+            44, 165, 187, 175, 178, 194, 160, 48, 228, 244, 121, 181, 115, 163, 225, 104, 179, 1,
+            195, 12, 171, 225, 116, 250, 252, 42, 5, 167, 97, 207, 115, 174,
+        ];
+        let key = wrapping_key(b"harmless-audit-fixture", b"nonsecret-salt16!")?;
+        assert!(key.as_slice().eq(&expected), "V1 KDF output preserved");
+        assert!(matches!(
+            wrapping_key(b"harmless-audit-fixture", b"short"),
+            Err(Error::Unavailable)
+        ));
+        assert!(matches!(
+            wrapping_key(b"", b"nonsecret-salt16!"),
+            Err(Error::InvalidInput)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn native_envelope_encrypts_generated_material_without_plaintext() {

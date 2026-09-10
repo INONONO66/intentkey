@@ -13,7 +13,10 @@ use color_eyre::eyre::{Context, Result, eyre};
 use intentkey_core::{
     CredentialKind, DaemonRequest, DaemonResponse, Intent, ItemId, SetupRequest, TargetOrigin,
     default_socket_path,
-    owner::{NativeKind, OwnerRequest, OwnerResponse},
+    owner::{
+        NativeKind, OwnerRequest, OwnerResponse, ProviderConfig, ProviderImportRequest,
+        ProviderKind, ProviderOwnerRequest,
+    },
     read_wire_value, write_wire_value,
 };
 use tokio::{net::UnixStream, time::timeout};
@@ -71,6 +74,11 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum VaultCommand {
+    /// Read-only external providers on the authenticated private owner channel.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     /// Initialize a new encrypted vault; never overwrite an existing vault.
     Init,
     /// Unlock persisted custody after authentication.
@@ -102,6 +110,98 @@ enum VaultCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// Validate an existing owner-authenticated vendor session and exact vault/share.
+    Connect {
+        #[arg(long, value_enum)]
+        kind: ProviderFamily,
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        session_dir: PathBuf,
+        #[arg(long)]
+        vault_id: String,
+        /// Owner-only file in session-dir; encrypt its op service-account token on connect.
+        #[arg(long)]
+        service_account_file: Option<PathBuf>,
+    },
+    /// List persisted opaque connections (not a live vendor health probe).
+    Status,
+    /// Refresh opaque importable Login password selections; invalidates prior selections.
+    List {
+        #[arg(long)]
+        provider_id: String,
+    },
+    /// Import one exact stored password selection into native encrypted custody.
+    Import {
+        #[arg(long)]
+        provider_id: String,
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, value_parser = parse_component)]
+        component_id: intentkey_core::ComponentId,
+    },
+    /// Remove the local connection and mapping; does not delete imported native items.
+    Disconnect {
+        #[arg(long)]
+        provider_id: String,
+    },
+}
+
+fn parse_component(value: &str) -> Result<intentkey_core::ComponentId, String> {
+    intentkey_core::ComponentId::new(value).map_err(|_| "InvalidInput".to_owned())
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProviderFamily {
+    ProtonPass,
+    OnePassword,
+}
+
+impl From<ProviderCommand> for ProviderOwnerRequest {
+    fn from(command: ProviderCommand) -> Self {
+        match command {
+            ProviderCommand::Connect {
+                kind,
+                executable,
+                home,
+                session_dir,
+                vault_id,
+                service_account_file,
+            } => Self::Connect(ProviderConfig {
+                kind: match kind {
+                    ProviderFamily::ProtonPass => ProviderKind::ProtonPass,
+                    ProviderFamily::OnePassword => ProviderKind::OnePassword,
+                },
+                executable,
+                home,
+                session_dir,
+                vault_id,
+                service_account_file,
+            }),
+            ProviderCommand::Status => Self::Connections,
+            ProviderCommand::List { provider_id } => Self::List { provider_id },
+            ProviderCommand::Disconnect { provider_id } => Self::Disconnect { provider_id },
+            ProviderCommand::Import {
+                provider_id,
+                item_id,
+                revision,
+                component_id,
+            } => Self::Import(ProviderImportRequest {
+                provider_id,
+                item_id: ItemId::new(item_id),
+                revision,
+                component_id,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum VaultKind {
     Password,
@@ -111,6 +211,7 @@ enum VaultKind {
 impl From<VaultCommand> for OwnerRequest {
     fn from(command: VaultCommand) -> Self {
         match command {
+            VaultCommand::Provider { command } => Self::Provider(command.into()),
             VaultCommand::Init => Self::Init,
             VaultCommand::Unlock => Self::Unlock,
             VaultCommand::Lock => Self::Lock,

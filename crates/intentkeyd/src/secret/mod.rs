@@ -2,6 +2,8 @@
 
 mod native;
 mod native_format;
+mod providers;
+mod subprocess;
 
 use std::{
     fmt, fs,
@@ -259,5 +261,12 @@ fn dispatch(vault: &mut NativeVault, input: PrivateRequest) -> Result<OwnerRespo
             Ok(OwnerResponse::Removed(item_id))
         }
         OwnerRequest::Init | OwnerRequest::Unlock => Err(Error::InvalidInput),
+        OwnerRequest::Provider(request) => Ok(OwnerResponse::Provider(
+            tokio::runtime::Handle::current().block_on(async {
+                timeout(Duration::from_secs(90), providers::dispatch(vault, request))
+                    .await
+                    .map_err(|_| Error::Timeout)?
+            })?,
+        )),
     }
 }

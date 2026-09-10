@@ -11,12 +11,18 @@ use std::{
 use intentkey_core::{
     ComponentId, ComponentPresence, ItemDescriptor, ItemId, ItemKind, LoginComponentKind,
     LoginComponentMetadata, OperationSupport,
-    owner::{NativeKind, SecretErrorCode as Error, VaultStatus},
+    owner::{
+        NativeKind, ProviderComponentKind, ProviderConfig, ProviderConnectionMetadata,
+        ProviderImportRequest, ProviderItemMetadata, SecretErrorCode as Error, VaultStatus,
+    },
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::native_format::Envelope;
+use super::{
+    native_format::Envelope,
+    providers::{self, Mapping, Source},
+};
 
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 const MAX_PAYLOAD: usize = MAX_SNAPSHOT - 148 - 16;
@@ -38,10 +44,23 @@ struct Item {
     value: Zeroizing<Vec<u8>>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRecordMetadata {
+    connection: ProviderConnectionMetadata,
+    config: ProviderConfig,
+    mappings: Vec<Mapping>,
+}
+struct ProviderRecord {
+    metadata: ProviderRecordMetadata,
+    token: Zeroizing<Vec<u8>>,
+}
+
 struct Custody {
     envelope: Envelope,
     generation: u64,
     items: Vec<Item>,
+    providers: Vec<ProviderRecord>,
 }
 
 pub(super) struct NativeVault {
@@ -300,7 +319,255 @@ fn decode_payload(mut input: &[u8], generation: u64) -> Result<Vec<Item>, Error>
     Ok(items)
 }
 
+// V2 wraps the strict V1 item frame and adds bounded encrypted provider records.
+// Tokens are separately framed bytes, never serde values or printable metadata.
+fn encode_snapshot<'a>(
+    items: impl Iterator<Item = &'a Item>,
+    providers: impl Iterator<Item = &'a ProviderRecord>,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let items = encode_payload(items)?;
+    let mut records = Vec::new();
+    let mut length = 16 + items.len();
+    for record in providers {
+        if records.len() == 16 {
+            return Err(Error::TooLarge);
+        }
+        let metadata =
+            Zeroizing::new(serde_json::to_vec(&record.metadata).map_err(|_| Error::InvalidInput)?);
+        if metadata.len() > 65_536 || record.token.len() > 8192 {
+            return Err(Error::TooLarge);
+        }
+        length += 8 + metadata.len() + record.token.len();
+        if length > MAX_PAYLOAD {
+            return Err(Error::TooLarge);
+        }
+        records.push((metadata, &record.token));
+    }
+    if length > MAX_PAYLOAD {
+        return Err(Error::TooLarge);
+    }
+    let mut output = Zeroizing::new(Vec::with_capacity(length));
+    output.extend_from_slice(b"IKSNAP02");
+    put_length(&mut output, items.len())?;
+    output.extend_from_slice(&items);
+    put_length(&mut output, records.len())?;
+    for (metadata, token) in records {
+        put_length(&mut output, metadata.len())?;
+        output.extend_from_slice(&metadata);
+        put_length(&mut output, token.len())?;
+        output.extend_from_slice(token);
+    }
+    Ok(output)
+}
+
+fn decode_snapshot(
+    mut input: &[u8],
+    generation: u64,
+) -> Result<(Vec<Item>, Vec<ProviderRecord>), Error> {
+    if input.starts_with(PAYLOAD_MAGIC) {
+        return Ok((decode_payload(input, generation)?, Vec::new()));
+    }
+    if take(&mut input, 8)? != b"IKSNAP02" {
+        return Err(Error::InvalidInput);
+    }
+    let length = take_length(&mut input, MAX_PAYLOAD)?;
+    let items = decode_payload(take(&mut input, length)?, generation)?;
+    let count = take_length(&mut input, 16)?;
+    let mut records = Vec::with_capacity(count);
+    let mut ids = HashSet::new();
+    let mut mapping_ids = HashSet::new();
+    let mut component_ids = HashSet::new();
+    for _ in 0..count {
+        let length = take_length(&mut input, 65_536)?;
+        let metadata: ProviderRecordMetadata =
+            serde_json::from_slice(take(&mut input, length)?).map_err(|_| Error::InvalidInput)?;
+        if !ids.insert(metadata.connection.provider_id.clone())
+            || metadata.connection.kind != metadata.config.kind
+            || metadata.mappings.len() > 32
+        {
+            return Err(Error::InvalidInput);
+        }
+        providers::id(&metadata.config.vault_id)?;
+        let mut source_ids = HashSet::new();
+        for mapping in &metadata.mappings {
+            let m = &mapping.metadata;
+            if m.provider_id != metadata.connection.provider_id
+                || m.revision == 0
+                || m.revision > generation
+                || m.components.len() != 1
+                || !mapping_ids.insert(m.item_id.clone())
+                || !source_ids.insert(mapping.source.item_id.clone())
+            {
+                return Err(Error::InvalidInput);
+            }
+            let component = &m.components[0];
+            if component.kind != ProviderComponentKind::Password
+                || !component.importable
+                || !component_ids.insert(component.component_id.clone())
+                || mapping.source.revision.is_empty()
+                || mapping.source.revision.len() > 256
+            {
+                return Err(Error::InvalidInput);
+            }
+            providers::id(&mapping.source.item_id)?;
+        }
+        let length = take_length(&mut input, 8192)?;
+        let token = Zeroizing::new(take(&mut input, length)?.to_vec());
+        if !token.iter().all(u8::is_ascii_graphic)
+            || (!token.is_empty()
+                && metadata.connection.kind != intentkey_core::owner::ProviderKind::OnePassword)
+        {
+            return Err(Error::InvalidInput);
+        }
+        records.push(ProviderRecord { metadata, token });
+    }
+    if !input.is_empty() {
+        return Err(Error::InvalidInput);
+    }
+    Ok((items, records))
+}
+
 impl NativeVault {
+    pub(super) fn connections(&self) -> Result<Vec<ProviderConnectionMetadata>, Error> {
+        Ok(self
+            .custody
+            .as_ref()
+            .ok_or(Error::Locked)?
+            .providers
+            .iter()
+            .map(|p| p.metadata.connection.clone())
+            .collect())
+    }
+    fn provider_index(&self, provider_id: &str) -> Result<usize, Error> {
+        self.custody
+            .as_ref()
+            .ok_or(Error::Locked)?
+            .providers
+            .iter()
+            .position(|p| p.metadata.connection.provider_id == provider_id)
+            .ok_or(Error::NotFound)
+    }
+    pub(super) fn provider_config(
+        &self,
+        provider_id: &str,
+    ) -> Result<(&ProviderConfig, &[u8]), Error> {
+        let index = self.provider_index(provider_id)?;
+        let record = &self.custody.as_ref().ok_or(Error::Locked)?.providers[index];
+        Ok((&record.metadata.config, &record.token))
+    }
+    pub(super) fn connect_provider(
+        &mut self,
+        mut config: ProviderConfig,
+        token: Zeroizing<Vec<u8>>,
+    ) -> Result<ProviderConnectionMetadata, Error> {
+        let custody = self.custody.as_ref().ok_or(Error::Locked)?;
+        config.service_account_file = None; // Input path is not a standing file grant.
+        let connection =
+            providers::connection(format!("prv_{}", random_id()?.simple()), config.kind);
+        let record = ProviderRecord {
+            metadata: ProviderRecordMetadata {
+                connection: connection.clone(),
+                config,
+                mappings: Vec::new(),
+            },
+            token,
+        };
+        let payload = encode_snapshot(
+            custody.items.iter(),
+            custody.providers.iter().chain(std::iter::once(&record)),
+        )?;
+        self.custody
+            .as_mut()
+            .ok_or(Error::Locked)?
+            .providers
+            .try_reserve(1)
+            .map_err(|_| Error::Unavailable)?;
+        self.commit(&payload)?;
+        self.custody
+            .as_mut()
+            .ok_or(Error::Locked)?
+            .providers
+            .push(record);
+        Ok(connection)
+    }
+    pub(super) fn disconnect_provider(&mut self, provider_id: &str) -> Result<(), Error> {
+        let index = self.provider_index(provider_id)?;
+        let custody = self.custody.as_ref().ok_or(Error::Locked)?;
+        let payload = encode_snapshot(
+            custody.items.iter(),
+            custody
+                .providers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| (i != index).then_some(p)),
+        )?;
+        self.commit(&payload)?;
+        self.custody
+            .as_mut()
+            .ok_or(Error::Locked)?
+            .providers
+            .remove(index);
+        Ok(())
+    }
+    pub(super) fn save_provider_mappings(
+        &mut self,
+        provider_id: &str,
+        source: Vec<Source>,
+    ) -> Result<Vec<ProviderItemMetadata>, Error> {
+        let index = self.provider_index(provider_id)?;
+        let custody = self.custody.as_ref().ok_or(Error::Locked)?;
+        let mut metadata = custody.providers[index].metadata.clone();
+        metadata.mappings = providers::mappings(
+            provider_id,
+            custody.generation.checked_add(1).ok_or(Error::TooLarge)?,
+            source,
+        )?;
+        let result = metadata
+            .mappings
+            .iter()
+            .map(|m| m.metadata.clone())
+            .collect();
+        let record = ProviderRecord {
+            metadata,
+            token: Zeroizing::new(custody.providers[index].token.to_vec()),
+        };
+        let payload = encode_snapshot(
+            custody.items.iter(),
+            custody
+                .providers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| if i == index { &record } else { p }),
+        )?;
+        self.commit(&payload)?;
+        self.custody.as_mut().ok_or(Error::Locked)?.providers[index] = record;
+        Ok(result)
+    }
+    pub(super) fn provider_mapping(
+        &self,
+        request: &ProviderImportRequest,
+    ) -> Result<Source, Error> {
+        let index = self.provider_index(&request.provider_id)?;
+        let mappings = &self.custody.as_ref().ok_or(Error::Locked)?.providers[index]
+            .metadata
+            .mappings;
+        let mapping = mappings
+            .iter()
+            .find(|m| m.metadata.item_id == request.item_id)
+            .ok_or(Error::NotFound)?;
+        if mapping.metadata.revision != request.revision {
+            return Err(Error::RevisionMismatch);
+        }
+        if !mapping.metadata.components.iter().any(|c| {
+            c.component_id == request.component_id
+                && c.importable
+                && c.kind == ProviderComponentKind::Password
+        }) {
+            return Err(Error::Unsupported);
+        }
+        Ok(mapping.source.clone())
+    }
+
     /// Opens existing private storage and holds an exclusive writer lock until drop.
     pub(super) fn open(directory: &Path) -> Result<Self, Error> {
         let (directory, directory_file) = private_directory(directory)?;
@@ -338,7 +605,7 @@ impl NativeVault {
             return Err(Error::AlreadyInitialized);
         }
         let envelope = Envelope::create(passphrase)?;
-        let payload = encode_payload(std::iter::empty())?;
+        let payload = encode_snapshot(std::iter::empty(), std::iter::empty())?;
         let ciphertext = Zeroizing::new(envelope.encode(&payload, 1)?);
         match self.persist(&ciphertext, true) {
             Ok(()) => {
@@ -347,6 +614,7 @@ impl NativeVault {
                     envelope,
                     generation: 1,
                     items: Vec::new(),
+                    providers: Vec::new(),
                 });
                 Ok(())
             }
@@ -374,11 +642,12 @@ impl NativeVault {
             return Err(Error::TooLarge);
         }
         let (envelope, payload, generation) = Envelope::decode(passphrase, &ciphertext)?;
-        let items = decode_payload(&payload, generation)?;
+        let (items, providers) = decode_snapshot(&payload, generation)?;
         Ok(Custody {
             envelope,
             generation,
             items,
+            providers,
         })
     }
 
@@ -442,7 +711,10 @@ impl NativeVault {
             },
             value,
         };
-        let payload = encode_payload(custody.items.iter().chain(std::iter::once(&item)))?;
+        let payload = encode_snapshot(
+            custody.items.iter().chain(std::iter::once(&item)),
+            custody.providers.iter(),
+        )?;
         self.custody
             .as_mut()
             .ok_or(Error::Locked)?
@@ -488,9 +760,14 @@ impl NativeVault {
             },
             value,
         };
-        let payload = encode_payload(custody.items.iter().enumerate().map(|(position, old)| {
-            if position == index { &item } else { old }
-        }))?;
+        let payload = encode_snapshot(
+            custody.items.iter().enumerate().map(
+                |(position, old)| {
+                    if position == index { &item } else { old }
+                },
+            ),
+            custody.providers.iter(),
+        )?;
         self.commit(&payload)?;
         let result = item.metadata.descriptor.clone();
         self.custody.as_mut().ok_or(Error::Locked)?.items[index] = item;
@@ -500,12 +777,13 @@ impl NativeVault {
     pub(super) fn remove(&mut self, id: &ItemId, revision: u64) -> Result<(), Error> {
         let index = self.index(id, revision)?;
         let custody = self.custody.as_ref().ok_or(Error::Locked)?;
-        let payload = encode_payload(
+        let payload = encode_snapshot(
             custody
                 .items
                 .iter()
                 .enumerate()
                 .filter_map(|(position, item)| (position != index).then_some(item)),
+            custody.providers.iter(),
         )?;
         self.commit(&payload)?;
         self.custody
@@ -1026,6 +1304,131 @@ mod tests {
             },
             value: random(length),
         })
+    }
+
+    #[test]
+    fn provider_v2_records_preserve_v1_and_atomicity() -> Result<(), Box<dyn std::error::Error>> {
+        use intentkey_core::owner::ProviderKind;
+        let (_directory, path) = directory()?;
+        let pass = random(32);
+        let value = random(80);
+        // Publish a real V1 encrypted snapshot, then migrate it on provider connect.
+        let old_item = test_item(0, 80)?;
+        let envelope = Envelope::create(&pass)?;
+        let old_payload = encode_payload(std::iter::once(&old_item))?;
+        let mut vault = NativeVault::open(&path)?;
+        vault.persist(&envelope.encode(&old_payload, 1)?, true)?;
+        vault.unlock(&pass)?;
+        assert!(
+            vault
+                .resolve(&old_item.metadata.descriptor.item_id, 1, NativeKind::Bearer)?
+                .as_slice()
+                .eq(old_item.value.as_slice())
+        );
+        let config = ProviderConfig {
+            kind: ProviderKind::ProtonPass,
+            executable: path.join("pass-cli"),
+            home: path.clone(),
+            session_dir: path.clone(),
+            vault_id: "vault1".into(),
+            service_account_file: None,
+        };
+        let connection = vault.connect_provider(config, Zeroizing::new(Vec::new()))?;
+        let source = || {
+            vec![Source {
+                item_id: "item1".into(),
+                revision: "1".into(),
+                fingerprint: [0; 32],
+            }]
+        };
+        let metadata = vault.save_provider_mappings(&connection.provider_id, source())?;
+        let selected = ProviderImportRequest {
+            provider_id: connection.provider_id.clone(),
+            item_id: metadata[0].item_id.clone(),
+            revision: metadata[0].revision,
+            component_id: metadata[0].components[0].component_id.clone(),
+        };
+        let disk = fs::read(path.join("native.vault"))?;
+        for fault in [Fault::Write, Fault::FileSync, Fault::Publish] {
+            vault.fault = Some(fault);
+            assert!(matches!(
+                vault.disconnect_provider(&connection.provider_id),
+                Err(Error::Unavailable)
+            ));
+            assert!(matches!(
+                vault.save_provider_mappings(&connection.provider_id, source()),
+                Err(Error::Unavailable)
+            ));
+            assert!(vault.provider_mapping(&selected).is_ok());
+            assert!(fs::read(path.join("native.vault"))?.eq(&disk));
+        }
+        vault.fault = None;
+        let native = vault.store(NativeKind::Password, Zeroizing::new(value.to_vec()))?;
+        vault.lock();
+        vault.unlock(&pass)?;
+        assert_eq!(vault.connections()?, std::slice::from_ref(&connection));
+        assert!(vault.provider_mapping(&selected).is_ok());
+        assert!(
+            vault
+                .resolve(&native.item_id, native.revision, NativeKind::Password)?
+                .as_slice()
+                .eq(value.as_slice())
+        );
+        vault.save_provider_mappings(&connection.provider_id, source())?;
+        assert!(matches!(
+            vault.provider_mapping(&selected),
+            Err(Error::NotFound)
+        ));
+        vault.disconnect_provider(&connection.provider_id)?;
+        vault.lock();
+        vault.unlock(&pass)?;
+        assert!(vault.connections()?.is_empty());
+        assert_eq!(vault.list()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_v2_rejects_duplicate_refs_and_truncation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use intentkey_core::owner::ProviderKind;
+        let (_directory, path) = directory()?;
+        let pass = random(32);
+        let mut vault = NativeVault::open(&path)?;
+        vault.initialize(&pass)?;
+        let config = ProviderConfig {
+            kind: ProviderKind::ProtonPass,
+            executable: path.join("pass-cli"),
+            home: path.clone(),
+            session_dir: path,
+            vault_id: "vault1".into(),
+            service_account_file: None,
+        };
+        let connection = vault.connect_provider(config, Zeroizing::new(Vec::new()))?;
+        vault.save_provider_mappings(
+            &connection.provider_id,
+            vec![Source {
+                item_id: "item1".into(),
+                revision: "1".into(),
+                fingerprint: [0; 32],
+            }],
+        )?;
+        let custody = vault.custody.as_mut().ok_or(Error::Locked)?;
+        let record = &custody.providers[0];
+        let duplicate = encode_snapshot(custody.items.iter(), [record, record].into_iter())?;
+        assert!(matches!(
+            decode_snapshot(&duplicate, custody.generation),
+            Err(Error::InvalidInput)
+        ));
+        let encoded = encode_snapshot(custody.items.iter(), custody.providers.iter())?;
+        assert!(decode_snapshot(&encoded[..encoded.len() - 1], custody.generation).is_err());
+        let m = &mut custody.providers[0].metadata.mappings[0];
+        m.metadata.provider_id = "wrong".into();
+        let encoded = encode_snapshot(custody.items.iter(), custody.providers.iter())?;
+        assert!(matches!(
+            decode_snapshot(&encoded, custody.generation),
+            Err(Error::InvalidInput)
+        ));
+        Ok(())
     }
 
     #[test]

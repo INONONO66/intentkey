@@ -21,6 +21,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+include!("provider_process.rs.inc");
+
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const DEADLINE: Duration = Duration::from_secs(120);
 
@@ -43,6 +45,7 @@ impl Daemon {
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env("RUST_LOG", "intentkeyd=info")
             .env("NO_COLOR", "1")
+            .env("PROVIDER_POISON", "must-not-reach-provider")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;

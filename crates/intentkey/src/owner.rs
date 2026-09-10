@@ -4,7 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     path::Path,
     pin::Pin,
     task::{Context, Poll},
@@ -69,13 +69,16 @@ async fn exchange(
     secret_fd: Option<i32>,
 ) -> Result<OwnerResponse, SecretErrorCode> {
     let (passphrase, value) = collect_input(request, secret_fd).await?;
-    let mut stream = timeout(
-        ADMISSION_DEADLINE,
-        UnixStream::connect(owner_socket_path(socket)),
-    )
-    .await
-    .map_err(|_| SecretErrorCode::Timeout)?
-    .map_err(|_| SecretErrorCode::Unavailable)?;
+    let socket = owner_socket_path(socket);
+    let owner_uid = nix::unistd::geteuid().as_raw();
+    validate_owner_socket(&socket, owner_uid)?;
+    let mut stream = timeout(ADMISSION_DEADLINE, UnixStream::connect(&socket))
+        .await
+        .map_err(|_| SecretErrorCode::Timeout)?
+        .map_err(output_error)?;
+    // Authenticate the connected endpoint, not just the pathname. In particular,
+    // a foreign peer must never receive even the first metadata or secret frame.
+    check_owner_peer(stream.peer_cred().map_err(output_error)?.uid(), owner_uid)?;
     timeout(
         FRAME_DEADLINE,
         write_request(
@@ -92,6 +95,36 @@ async fn exchange(
     timeout(RESPONSE_DEADLINE, read_response(&mut stream))
         .await
         .map_err(|_| SecretErrorCode::Timeout)?
+}
+
+fn validate_owner_socket(socket: &Path, owner_uid: u32) -> Result<(), SecretErrorCode> {
+    let parent = socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(SecretErrorCode::Unavailable)?;
+    // Do not repair permissions or follow a preplanted immediate directory/socket
+    // symlink. System ancestors such as macOS /tmp may legitimately be symlinks.
+    let directory = std::fs::symlink_metadata(parent).map_err(output_error)?;
+    if !directory.is_dir() || directory.uid() != owner_uid || directory.mode() & 0o7777 != 0o700 {
+        return Err(SecretErrorCode::Unavailable);
+    }
+    let endpoint = std::fs::symlink_metadata(socket).map_err(output_error)?;
+    if !endpoint.file_type().is_socket()
+        || endpoint.uid() != owner_uid
+        || endpoint.mode() & 0o7777 != 0o600
+    {
+        return Err(SecretErrorCode::Unavailable);
+    }
+    Ok(())
+}
+
+const fn check_owner_peer(peer_uid: u32, owner_uid: u32) -> Result<(), SecretErrorCode> {
+    // Same-UID hostile processes (including private fake daemons) are outside the
+    // owner boundary; peer credentials do not establish executable identity.
+    if peer_uid != owner_uid {
+        return Err(SecretErrorCode::Unavailable);
+    }
+    Ok(())
 }
 
 const fn needs_value(request: &OwnerRequest) -> bool {
@@ -459,6 +492,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owner_peer_requires_matching_effective_uid() {
+        let owner_uid = nix::unistd::geteuid().as_raw();
+        assert!(check_owner_peer(owner_uid, owner_uid).is_ok());
+        assert!(matches!(
+            check_owner_peer(owner_uid.wrapping_add(1), owner_uid),
+            Err(SecretErrorCode::Unavailable)
+        ));
+    }
+
     #[tokio::test]
     async fn metadata_and_secret_frames_are_separate() -> Result<(), SecretErrorCode> {
         let passphrase = marker(32);
@@ -611,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_uses_owner_socket_and_framed_unix_fd() -> Result<(), SecretErrorCode> {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| SecretErrorCode::Unavailable)?
@@ -625,6 +668,8 @@ mod tests {
         let agent = directory.join("agent.sock");
         let socket = owner_socket_path(&agent);
         let listener = tokio::net::UnixListener::bind(&socket).map_err(output_error)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(output_error)?;
         let secret = marker(32);
         let (reader, mut writer) = std::os::unix::net::UnixStream::pair().map_err(output_error)?;
         io::Write::write_all(&mut writer, &32_u32.to_be_bytes()).map_err(output_error)?;

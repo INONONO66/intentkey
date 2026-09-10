@@ -648,7 +648,21 @@ mod tests {
         drop(input);
         assert!(matches!(result, Err(SecretErrorCode::InvalidInput)));
         let restored = termios::tcgetattr(&slave).map_err(|_| SecretErrorCode::Unavailable)?;
-        assert_eq!(restored, original);
+        // musl leaves unused termios slots unspecified. Compare the settings
+        // this input guard changes, rather than ABI-private storage.
+        assert_eq!(restored.input_flags, original.input_flags);
+        assert_eq!(restored.output_flags, original.output_flags);
+        assert_eq!(restored.control_flags, original.control_flags);
+        assert_eq!(restored.local_flags, original.local_flags);
+        for index in [
+            SpecialCharacterIndices::VMIN,
+            SpecialCharacterIndices::VTIME,
+        ] {
+            assert_eq!(
+                restored.control_chars[index as usize],
+                original.control_chars[index as usize]
+            );
+        }
         Ok(())
     }
 

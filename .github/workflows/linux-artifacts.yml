@@ -1,0 +1,95 @@
+name: linux-artifacts
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  linux-x86_64-musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install native musl tooling
+        run: |
+          test "$(uname -m)" = x86_64
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools binutils
+      - name: Build adjacent test binaries and run native musl tests
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/intentkey-linux-tests
+        run: |
+          # native_process.rs locates intentkey next to CARGO_BIN_EXE_intentkeyd.
+          cargo build --locked --workspace --bins --all-features --target "$TARGET"
+          cargo test --locked --workspace --all-targets --all-features --target "$TARGET"
+      - name: Build production binaries without test-harness
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/intentkey-linux-production
+        run: >-
+          cargo build --locked --release --no-default-features
+          --target "$TARGET" -p intentkey -p intentkeyd --bins
+      - name: Package, extract, verify static ELF, and smoke-test exact artifacts
+        id: package
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/intentkey-linux-production
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          sha="$(git rev-parse HEAD)"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          name="intentkey-${version}-${TARGET}-${sha}"
+          stage="$(mktemp -d "$RUNNER_TEMP/intentkey-stage.XXXXXX")"
+          package="$stage/$name"
+          mkdir -p "$package/docs" dist
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/intentkey" "$package/intentkey"
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/intentkeyd" "$package/intentkeyd"
+          install -m 0644 LICENSE-MIT LICENSE-APACHE README.md "$package/"
+          install -m 0644 docs/linux.md docs/threat-model.md "$package/docs/"
+          printf 'commit=%s\ntarget=%s\nversion=%s\nfeatures=none\n' "$sha" "$TARGET" "$version" > "$package/BUILD-INFO"
+          rustc --version >> "$package/BUILD-INFO"
+          (cd "$package" && sha256sum intentkey intentkeyd LICENSE-MIT LICENSE-APACHE README.md docs/*.md BUILD-INFO > SHA256SUMS)
+          tar -C "$stage" -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" && sha256sum -c "$name.tar.gz.sha256")
+          extracted="$(mktemp -d "$RUNNER_TEMP/intentkey-extracted.XXXXXX")"
+          tar -xzf "dist/$name.tar.gz" -C "$extracted"
+          (cd "$extracted/$name" && sha256sum -c SHA256SUMS)
+          for binary in intentkey intentkeyd; do
+            path="$extracted/$name/$binary"
+            test "$(stat -c '%a' "$path")" = 755
+            readelf -hW "$path" > "$stage/$binary.header"
+            readelf -lW "$path" > "$stage/$binary.programs"
+            readelf -dW "$path" > "$stage/$binary.dynamic"
+            grep -Eq 'Class:[[:space:]]+ELF64' "$stage/$binary.header"
+            grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' "$stage/$binary.header"
+            if grep -q 'INTERP' "$stage/$binary.programs"; then
+              echo 'Unexpected ELF interpreter' >&2
+              exit 1
+            fi
+            if grep -q '(NEEDED)' "$stage/$binary.dynamic"; then
+              echo 'Unexpected shared-library dependency' >&2
+              exit 1
+            fi
+          done
+          python3 scripts/linux-smoke.py --cli "$extracted/$name/intentkey" --daemon "$extracted/$name/intentkeyd"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: Upload only smoke-tested archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error

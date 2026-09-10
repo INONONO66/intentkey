@@ -14,8 +14,23 @@ screenshots, or debug output.
 - the owner approval surface;
 - the operating-system IPC and process isolation mechanisms.
 
-The agent runtime, model provider, target website, and ordinary application logs
-are not trusted with credential plaintext.
+The agent runtime, model provider, and ordinary application logs must not receive
+credential plaintext. An explicitly approved target is an authorized recipient
+for its operation; protection against that recipient's compromise is excluded.
+
+## Native vault custody
+
+Native storage is being added after the metadata-only initial milestone.
+The owner client and daemon's private secret module are trusted with plaintext.
+Owner input uses a separate bounded channel, not the agent JSON protocol.
+Every owner management request authenticates independently; an unlocked vault
+does not turn an ordinary agent session into owner authority.
+
+Encrypted storage and private Unix sockets do not isolate hostile processes
+running with the same OS-user authority. Zeroizing buffers do not guarantee
+erasure of operating-system copies, swap, or captured memory. Authenticated
+encryption does not detect replay of an entire older valid vault snapshot.
+Deleting a file does not prove removal from SSDs or backups.
 
 ## Claims
 
@@ -44,9 +59,10 @@ Secure browser injection requires a privileged extension or native host that:
 Without those controls, filling a password input does not prevent browser
 automation from reading it back.
 
-## Out of scope for the initial milestone
+## Not provided by the native-store milestone
 
 - protecting against a fully compromised operating-system account;
 - provider or target compromise;
 - browser injection;
-- durable credential storage.
+- recovery without the owner passphrase;
+- whole-snapshot rollback detection or secure erasure of backups.

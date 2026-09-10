@@ -1,5 +1,7 @@
 //! `IntentKey` protocol vocabulary and pure claim issuance.
 
+pub mod owner;
+
 use std::{env, fmt, io, path::PathBuf};
 
 use serde::de::{DeserializeOwned, Error as DeserializeError};

@@ -1,4 +1,8 @@
 //! `IntentKey` daemon request admission.
+mod secret;
+
+pub use secret::NativeService;
+
 use std::{
     collections::HashMap,
     fmt,
@@ -92,6 +96,9 @@ impl std::error::Error for StateError {}
 pub struct DaemonState {
     db: Mutex<Connection>,
     catalog: Mutex<HashMap<String, ItemDescriptor>>,
+    // Visible metadata only: native items have no executor in this phase and are
+    // deliberately excluded from the operation-admission catalog above.
+    native_catalog: Mutex<Vec<ItemDescriptor>>,
 }
 
 impl DaemonState {
@@ -117,7 +124,15 @@ impl DaemonState {
         Ok(Self {
             db: Mutex::new(db),
             catalog: Mutex::new(HashMap::new()),
+            native_catalog: Mutex::new(Vec::new()),
         })
+    }
+    fn replace_native_catalog(&self, items: Vec<ItemDescriptor>) -> Result<(), StateError> {
+        *self
+            .native_catalog
+            .lock()
+            .map_err(|_| StateError::StateUnavailable)? = items;
+        Ok(())
     }
     /// Registers metadata from a trusted internal provider/catalog harness.
     pub fn register_item(&self, descriptor: ItemDescriptor) -> Result<(), StateError> {
@@ -206,10 +221,21 @@ impl DaemonState {
             },
             DaemonRequest::ListItems { session } => {
                 match self.authorize_for_peer(&session, peer_uid).and_then(|()| {
-                    self.catalog
+                    let mut items: Vec<_> = self
+                        .catalog
                         .lock()
-                        .map(|c| c.values().cloned().collect())
-                        .map_err(|_| StateError::StateUnavailable)
+                        .map_err(|_| StateError::StateUnavailable)?
+                        .values()
+                        .cloned()
+                        .collect();
+                    items.extend(
+                        self.native_catalog
+                            .lock()
+                            .map_err(|_| StateError::StateUnavailable)?
+                            .iter()
+                            .cloned(),
+                    );
+                    Ok(items)
                 }) {
                     Ok(items) => DaemonResponse::ItemsListed { items },
                     Err(error) => rejected_state(error),

@@ -12,10 +12,11 @@ use std::{
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use intentkey_core::{
-    DaemonRequest, DaemonResponse, RefusalCode, default_socket_path, read_wire_value,
-    write_wire_value,
+    DaemonRequest, DaemonResponse, RefusalCode, default_socket_path,
+    owner::{default_data_dir, owner_socket_path},
+    read_wire_value, write_wire_value,
 };
-use tokio::{net::UnixListener, task::JoinSet, time::timeout};
+use tokio::{net::UnixListener, sync::Semaphore, task::JoinSet, time::timeout};
 use tracing::{Level, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -34,6 +35,10 @@ struct Cli {
     /// owned by this user and already 0700. Existing directories are never chmodded.
     #[arg(long, env = "INTENTKEY_SOCKET", default_value_os_t = default_socket_path())]
     socket: PathBuf,
+
+    /// Durable private native storage, independent of the runtime socket directory.
+    #[arg(long, default_value_os_t = default_data_dir())]
+    data_dir: PathBuf,
 
     /// Owner handoff UI base. It must be loopback HTTP.
     #[arg(
@@ -124,7 +129,34 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|_| eyre!("test metadata catalog item was invalid"))?;
         }
     }
+    let native = Arc::new(intentkeyd::NativeService::open(cli.data_dir.clone()).await?);
+    let owner_socket = owner_socket_path(&cli.socket);
+    if owner_socket == cli.socket {
+        return Err(eyre!("agent and owner socket paths must differ"));
+    }
+    prepare_socket(&owner_socket, uid)?;
+    let owner_listener = UnixListener::bind(&owner_socket)?;
+    let _owner_socket_guard = SocketGuard {
+        metadata: std::fs::symlink_metadata(&owner_socket)?,
+        path: owner_socket.clone(),
+    };
+    std::fs::set_permissions(&owner_socket, std::fs::Permissions::from_mode(0o600))?;
+    accept_connections(&cli, uid, listener, owner_listener, native, state).await
+}
+
+async fn accept_connections(
+    cli: &Cli,
+    uid: u32,
+    listener: UnixListener,
+    owner_listener: UnixListener,
+    native: Arc<intentkeyd::NativeService>,
+    state: Arc<intentkeyd::DaemonState>,
+) -> Result<()> {
+    let owner_slots = Arc::new(Semaphore::new(4));
     let mut connections = JoinSet::new();
+    // Subscribe before readiness so immediate shutdown cannot race registration.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tracing::info!(
         socket = %cli.socket.display(),
@@ -134,9 +166,20 @@ async fn run(cli: Cli) -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            signal = tokio::signal::ctrl_c() => {
-                signal.wrap_err("could not listen for shutdown signal")?;
-                break;
+            _ = interrupt.recv() => break,
+            _ = terminate.recv() => break,
+            accepted = owner_listener.accept() => {
+                let (stream, _) = accepted.wrap_err("owner socket accept failed")?;
+                // No unbounded queue of tasks or secret buffers waiting for admission.
+                if let Ok(admission) = Arc::clone(&owner_slots).try_acquire_owned() {
+                    let native = Arc::clone(&native);
+                    let state = Arc::clone(&state);
+                    connections.spawn(async move {
+                        if let Err(code) = native.serve(stream, uid, state, admission).await {
+                            warn!(%code, "owner.connection_failed");
+                        }
+                    });
+                }
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted.wrap_err("socket accept failed")?;
@@ -171,6 +214,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    native.shutdown(&state).await?;
     Ok(())
 }
 

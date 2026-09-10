@@ -4,8 +4,13 @@ IntentKey lets agents use credentials without receiving credential plaintext.
 
 ## Non-negotiable invariants
 
-- Never place plaintext credentials in protocol messages, links, logs, errors,
-  receipts, tests, snapshots, or command arguments.
+- Never place plaintext credentials in agent-facing protocol messages, links,
+  logs, errors, receipts, snapshots, or command arguments.
+- The dedicated owner input channel is a privileged secret data plane: bounded
+  raw frames carry passphrases and values directly into daemon secret custody,
+  never through `DaemonRequest`, JSON metadata, or agent tool results.
+- Tests use runtime-generated noncredential markers only through private test
+  channels; never print their bytes or persist them as plaintext fixtures.
 - Model-facing APIs expose metadata, opaque references, and receipts only.
 - Links contain short-lived, audience-bound, single-use claims, never secrets.
 - Providers retrieve secrets; injectors consume them. Only the privileged

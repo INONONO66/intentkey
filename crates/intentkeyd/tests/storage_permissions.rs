@@ -28,14 +28,21 @@ struct Daemon {
     child: Child,
     events: Receiver<Event>,
     output: Option<JoinHandle<TestResult<String>>>,
+    _home: tempfile::TempDir,
 }
 
 impl Daemon {
     fn start(socket: &Path) -> TestResult<Self> {
+        // Isolate durable storage even for rejected socket paths and concurrent daemons.
+        let home = private_directory()?;
+        let home_path = fs::canonicalize(home.path())?;
         // Inherit the caller's normal umask. Never mutate the Rust test process umask.
         let mut child = Command::new(env!("CARGO_BIN_EXE_intentkeyd"))
             .arg("--socket")
             .arg(socket)
+            .env("HOME", &home_path)
+            .env("XDG_DATA_HOME", home_path.join("data"))
+            .env("XDG_RUNTIME_DIR", home_path.join("runtime"))
             .env("RUST_LOG", "intentkeyd=info")
             .env("NO_COLOR", "1")
             .stdout(Stdio::null())
@@ -60,11 +67,21 @@ impl Daemon {
             child,
             events,
             output: Some(output),
+            _home: home,
         })
     }
 
     async fn ready(&mut self, socket: &Path) -> TestResult<()> {
-        assert_eq!(self.events.recv_timeout(DEADLINE)?, Event::Ready);
+        let event = self.events.recv_timeout(DEADLINE)?;
+        if event != Event::Ready {
+            let output = self
+                .output
+                .take()
+                .ok_or("missing output reader")?
+                .join()
+                .map_err(|_| "output reader panicked")??;
+            return Err(format!("daemon failed before readiness: {output}").into());
+        }
         assert!(
             self.child.try_wait()?.is_none(),
             "daemon exited after readiness"
